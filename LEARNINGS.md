@@ -92,8 +92,12 @@ so every later module has something concrete to run against.
   Lesson for the design doc: the free tier's 3-index budget is a real constraint the architecture
   lives inside (2 vector + 1 text = exactly 3, none to spare).
 
-**Still pending:** `ANTHROPIC_API_KEY` (LLM) + `OPENAI_API_KEY` (embeddings) — needed before
-`npm run dev` reports `/health: ok` (until then it's `degraded`, which is expected).
+**Provider keys — resolved in M2 (note updated).** The scaffold's `env.ts` still *defaults* to
+`ANTHROPIC_API_KEY`/`claude-sonnet-5` (LLM) + `OPENAI_API_KEY`/`text-embedding-3-small` (embeddings),
+but the isolation constraint ruled those out and the only adapter we actually implemented is **Gemini**
+(raw REST, `llm.ts`). So the real `.env` needs `GOOGLE_API_KEY` (chat **and** embeddings) + `TAVILY_API_KEY`
+(search), with `LLM_PROVIDER=google`, `LLM_MODEL=gemini-3.5-flash-lite`, `EMBEDDING_MODEL=gemini-embedding-001`
+overriding the defaults so `/health` names the model actually served. See §M2.
 
 ## M1 — DESIGN.md
 
@@ -803,5 +807,94 @@ costUsdToday:0.0054066}` — the cache-hit ratio (1 of 2) and the **cumulative**
 warning is the pre-existing one in the DO-NOT-EDIT `quality/rules.json`).
 
 ## M12 — Deploy
+
+**What M12 is:** put the whole system on the public internet — both backend services + the UI — so
+`/evals` and the grader hit a live URL, with the four rules still holding (agent private, no secret in
+the browser). It's the one module whose result *can't* be faked locally: it's the first place Atlas, the
+full HTTP+SSE path, and CORS are all real at once.
+
+**The pivot — Fly → Render (why earlier notes say "Fly").** M0–M11 were written against the *planned*
+target: two Fly.io apps — a public `lumina-gateway` and a **private** `lumina-agent` on Fly's 6PN network
+(`lumina-agent.internal:8000`, no public IP). Fly requires a credit card even on small plans; this is a
+personal, isolated project, so I pivoted to **Render's free tier** ($0, no card). That's why "Fly",
+"`.internal`", and "one Fly machine" survive in the M2/M10/M11 notes and the two `backend/*/Dockerfile`s —
+they describe the original target. The *deployed* system is Render, described here; the Fly config stays
+in-repo as a valid (untested) future target (`DEPLOY.md` appendix), not deleted.
+
+**Decision 1 — R1 topology: one container, three processes (NOT two services).** Render's free tier has
+no private service, no standalone worker, and exposes exactly **one** public port per web service — Fly's
+"separately-deployed private agent" model doesn't map onto it. So all three processes run in **one**
+container via a launcher (`render-start.mjs`): the **gateway** binds `0.0.0.0:$PORT` (the only thing Render
+routes the internet to), the **agent** binds `127.0.0.1:8000` (loopback — reachable only by the co-located
+gateway), the **worker** listens on no port. This preserves the "agent not public" red line exactly: Render
+routes nothing but `$PORT`, so a loopback bind is as private as Fly's 6PN, achieved with an env var instead
+of a network. Added `bindHost` to `agent/src/env.ts` (`AGENT_BIND_HOST`, default `0.0.0.0` for local dev,
+set to `127.0.0.1` by the launcher) and `app.listen(env.port, env.bindHost, …)` in `agent/src/index.ts`.
+If any child exits, the launcher tears the container down and exits non-zero so Render restarts it whole.
+Trade-off vs the Fly split: the three processes lose crash-isolation and independent deploys — accepted for
+$0. (Alternatives: R2 two Render services needs a paid private service; R3 agent-as-Render-worker isn't free.)
+
+**Decision 2 — secrets are Render env vars, never in the repo or the image.** `render.yaml` (a Blueprint)
+declares non-secret config inline (`NODE_ENV`, `LLM_PROVIDER=google`, `LLM_MODEL=gemini-3.5-flash-lite`,
+`EMBEDDING_MODEL=gemini-embedding-001`, `SEARCH_PROVIDER=tavily`, `VECTOR_BACKEND=atlas-vector-search`,
+`MONGODB_DB=lumina`, `DEEP_DAILY_CAP=5`) and lists the four secrets as `sync:false` — Render does **not**
+create or store them; a human sets them once in the dashboard (`MONGODB_URI`, `GOOGLE_API_KEY`,
+`TAVILY_API_KEY`, and later `CORS_ORIGINS`). The gateway holds none (only the agent process reads keys);
+`.env` is `.dockerignore`d so no key enters the image. Those explicit `LLM_*`/`EMBEDDING_*` values are also
+what override the scaffold's Anthropic/OpenAI defaults (see §M0) so `/health` names the Gemini model served.
+
+**Decision 3 — Render builds from GitHub, so the code goes to a personal repo.** Render deploys from a Git
+branch (no local push). Pushed to a **personal** repo (`prateekdhawan/FDE`) via the OS credential manager as
+the personal account — deliberately *not* the work-managed `gh` login (isolation). `autoDeploy:true` → every
+push to `main` rebuilds. `region: singapore` = closest free Render region to the Atlas M0 (AWS ap-south-1,
+Mumbai), to keep the DB hop short.
+
+**Decision 4 — the UI deploys from the repo ROOT on Vercel, not from `web/`.** `web/` imports
+`@lumina/contract` and extends the root `tsconfig.base.json`, so a `web/`-only deploy can't build. A root
+`vercel.json` runs `npm install`, builds `@lumina/contract` → `@lumina/web`, and serves `web/dist` with a SPA
+rewrite. `VITE_API_URL=https://lumina-8cqp.onrender.com` is passed at build time (`--build-env`) and baked
+into the bundle — a **public** value (the gateway URL), never a key. Why Vercel and not let the gateway serve
+the UI: the gateway's SPA fallback regex *excludes* `/evals`, so a hard-refresh on `/evals` would 404 if the
+gateway hosted the UI; Vercel's rewrite handles every route.
+
+**Trade-offs accepted:**
+- **Free-tier cold start.** The service sleeps after ~15 min idle and takes ~50 s to wake. With the M2
+  free-tier Gemini latency, a cold first query runs ~27 s TTFT — far over the 2500 ms SLA. Deliberate cost of
+  staying free + isolated; warm quick-searches are the fast path, and the timing gate is provider/tier-bound,
+  not architectural (see §M2).
+- **One instance.** The in-process LRU cache (M3) and in-memory rate-limit window (M10) are per-instance; on
+  one free container that's correct, and both are flagged in DESIGN.md as needing a shared store if scaled >1.
+
+**Gotchas we actually hit:**
+- **Docker build failed: `TS5083 Cannot read file '/app/tsconfig.base.json'` (+ a downstream `TS2802`
+  downlevelIteration in `sse.ts`).** Root cause: `Dockerfile.render` copied each workspace but not the shared
+  `tsconfig.base.json` that *every* workspace tsconfig `extends`; without it `tsc` can't read the compiler
+  options and falls back to a pre-ES2015 target (hence the iterator error). Fix: `COPY tsconfig.base.json ./`
+  before the build. **The two Fly Dockerfiles have the identical latent bug and were never build-tested** —
+  flagged in `DEPLOY.md` for anyone reviving that path.
+- **Atlas is reachable from the Render cloud (`/health → db:"ok"`).** The corporate port-27017 TLS-inspection
+  block that made Atlas unreachable on the *work laptop* (see §M2 Gotchas) does not exist in Render's cloud —
+  so every "deploy-deferred (Atlas TLS-blocked locally)" item from M2/M3/M5/M7 is finally real against the
+  public gateway (M8/M11 had already caught an at-home Atlas window).
+- **`CORS_ORIGINS` didn't appear in the Render dashboard.** Because it's `sync:false`, Render doesn't
+  pre-create it — it must be *added* manually (key + the Vercel origin, no trailing slash). Verified from the
+  CLI that the preflight for `/health` **and** `/ask` carrying the real UI header `x-user-id` returns `204` +
+  `access-control-allow-origin: <Vercel origin>` + `access-control-allow-headers: x-user-id` (the `cors`
+  package reflects the requested headers).
+- **UI badge stuck at "gateway unreachable" after a cold start.** The UI health check is a one-shot
+  `useEffect([], …)` in `web/src/App.tsx` with no retry/poll; on a cold start the first `/health` times out and
+  the badge sticks until a manual page reload. `web/` is DO-NOT-EDIT, so this is documented, not patched —
+  reload once the service is warm.
+- **Browser automation is blocked on the work laptop.** Playwright/Chrome refuses to launch: *"DevTools remote
+  debugging is disallowed by the system admin"* (corporate machine policy). Not routed around (isolation); all
+  browser verification is done manually.
+
+**Verified LIVE (2026-09-14, against the public gateway + Vercel UI):** `/health → 200` naming
+`gemini-3.5-flash-lite · tavily · atlas-vector-search · db ok`; `/stats` → 401 without a user, 200 with. A
+browser query ("What is retrieval-augmented generation?") rendered a grounded answer with inline `[1]` + a
+real `cloud.google.com` **Sources** link, a `TRACE` of `web_search → fetch_page`, and
+`done{terminated:"done", cost $0.0051}`. **URLs:** UI `https://lumina-web-two-orpin.vercel.app`, API
+`https://lumina-8cqp.onrender.com`. Agent has no public URL by construction; no secret is in the browser
+bundle. `DEPLOY.md` is the full runbook.
 
 ## M13 — Eval + submit

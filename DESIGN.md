@@ -2,100 +2,26 @@
 
 ## Components
 
-Five pieces, plus three stateful things that are not services.
-
-- **Web UI** (provided) — React + Vite, built to static files and served from **Vercel**. It
-  talks to exactly one thing: the gateway.
-- **Gateway service** — Express on `:8787`, **public**, deployed on Fly.io. The edge.
-- **Agent service** — Express on `:8000`, **private** (Fly internal networking), deployed on
-  Fly.io. The loop, the tools, memory, RAG, deep search. The only holder of provider keys.
-- **Jobs worker** — a background loop the agent service starts (`npm run worker`) that polls the
-  `jobs` collection and runs document ingestion off the request path.
-- **MongoDB Atlas** — one cluster, database `lumina`. Holds all authoritative state, the vectors,
-  and the raw uploaded files (GridFS).
-
-Not services, but they carry state or make decisions: the **`jobs` collection** (the ingestion
-work queue and the crash-recovery record), the **search cache** (an in-process LRU in front of a
-TTL'd `searchCache` collection), and the **run logs** (`runs/<requestId>.json`, one per answer —
-the trajectory the grader reads).
+LUMINA is two Express/TypeScript services plus a worker, one MongoDB Atlas database, and a static React UI. The **gateway** is the public edge: it is the only process the browser reaches, and in the deployed build it is the only one bound to a public port. The **agent** is the brain — the answer loop, its tools, retrieval, memory, deep search, and the only holder of provider keys; in the deploy it binds `127.0.0.1` only. The **jobs worker** is a third process from the same image with no listening port: it drains the ingest queue. Behind them sits one **Atlas** database of nine collections — `threads`, `messages`, `memories`, `spaces`, `documents`, `chunks`, `searchCache`, `jobs`, `requests` — plus **GridFS** for raw uploads and three Atlas Search indexes (two vector: `memories_vector`, `chunks_vector`; one text: `chunks_text`). The pieces that are *not* services still carry state and make decisions: the **`jobs` collection** is the durable work queue the worker polls and claims; the **search cache** is two tiers, an in-process LRU in front of the TTL'd `searchCache` collection; the **run logs** are one `runs/<requestId>.json` file per answer on the agent's disk (`runs/failing/` for capped or errored runs); and the **rate-limit window** is an in-memory per-user counter inside the gateway. The UI is static files on Vercel, with the gateway's public URL baked in at build time.
 
 ## Responsibilities
 
-The interesting part is what each component is the *only* one allowed to do.
-
-- Only the **agent service** may hold a provider key or call the LLM, the search provider, or the
-  embeddings API. The gateway reads no key, ever.
-- Only the **gateway** may talk to the browser: it owns CORS, serves the UI, checks `X-User-Id`
-  (→ `401`), validates request bodies with the shared zod contract (→ `400`), enforces a per-user
-  rate limit (→ `429`), assigns the `X-Request-Id`, passes the SSE stream through unbuffered, and
-  maps any upstream failure to `502`.
-- Only the **agent service** decides a deep request is over its daily cap (→ `429`). That decision
-  lives here, not on the edge, because a cap on the gateway is one you bypass by calling the agent
-  directly — so the cap belongs where the spend happens.
-- The **agent loop** is the only thing that chooses tools, and it is handed a *different toolset by
-  depth*: a quick run cannot even see `plan_research`, so it cannot escalate itself into a run that
-  costs several times more. It owns the caps, the honest `terminated` value, cost accounting, and
-  writing the run log.
-- Only the **worker** advances a document toward `indexed`. The upload handler's only job is to
-  store the file and enqueue — it never parses or embeds synchronously.
+The interesting part is the exclusions. The **gateway** is the *only* component allowed to talk to the browser, and it is the *only* one that is deliberately ignorant: it checks that an `X-User-Id` is present (401), validates request bodies against the shared contract schema (400), rate-limits the one expensive route (`POST …/ask`, 429), passes SSE through unbuffered, and returns 502 when it cannot reach the agent. It holds **no provider key** and makes no product decision — routing, retrieval, caps, and grounding are all downstream, so the public surface an attacker can reach has nothing secret behind it. The **agent** is the *only* key-holder (Gemini for chat and embeddings, Tavily for web search) and the *only* enforcer of the per-user daily deep-search cap — deliberately, because a cap on the edge is bypassed by calling the agent directly. It also re-checks ownership on every query, treating "not yours" as 404, never trusting that the edge scoped the data. The **worker** is the only component that runs the heavy ingest (parse → chunk → embed → probe → `indexed`); it shares the agent's image and keys but exposes no port.
 
 ## Communication
 
-- **Browser ↔ gateway:** HTTP for everything; Server-Sent Events for `POST /threads/:id/ask`. If
-  the gateway is down the browser gets a plain network error and the UI shows the request failed.
-- **Gateway ↔ agent:** HTTP, with the ask route proxied as a pass-through SSE stream (no
-  buffering, flush per event). If the agent throws or is unreachable, the gateway returns `502` —
-  never a `2xx` with a plausible body. An in-flight stream that breaks upstream ends as an `error`
-  event and the connection closes; the gateway never fabricates a `done`.
-- **Agent ↔ Atlas:** the MongoDB driver over TLS. If Mongo is down, `/health` reports `db: down`,
-  the service is `degraded`, and any request that needs to persist fails loudly (`502`) rather than
-  pretending to succeed.
-- **Agent ↔ worker:** entirely through the `jobs` collection — the agent inserts a `pending` row,
-  the worker claims and drains it. This is deliberately decoupled: if the worker is down, uploads
-  still return `202` and jobs simply queue; when it comes back it drains them. A worker killed
-  mid-job leaves a `running` row with a stale `claimedAt`, and a sweeper returns it to `pending`
-  without re-running the stages that already finished.
-- **Agent ↔ providers (LLM / search / embeddings):** HTTPS. A provider exception ends the run with
-  `terminated: "error"` and surfaces as a `502`. There is no `try/catch` that returns a fallback
-  answer — that is the exact bug (Live Translate) this rule exists to prevent.
+The browser talks to the gateway over HTTP, and the ask route is **SSE** (`text/event-stream`) so tokens stream as they are written. The gateway talks to the agent over HTTP — on the deploy that hop is **loopback** (`http://127.0.0.1:8000`), since the free tier routes traffic only to the gateway's public port, which is what keeps the agent private without a separate network. For a streaming reply the gateway detects the upstream `text/event-stream` content-type and relays bytes **as they arrive**, flushing each chunk and setting `X-Accel-Buffering: no` (buffering here would silently blow the TTFT SLA); for everything else it forwards the agent's status and body **verbatim**, so a 400/404/413/429-with-`resetsAt`/502 survives the hop unchanged. The worker never talks HTTP: it **polls the `jobs` collection**, claiming one row atomically with `findOneAndUpdate` (`pending → running`, oldest first) so two workers can't grab the same job, and a stale-claim sweeper returns rows stuck `running` back to `pending` (up to three attempts, then `failed`). When the other end is down the rule is fail-loud at every layer: if the agent is unreachable the gateway returns **502**, never a 2xx over a dead upstream; if a provider throws inside the agent, the run ends `terminated:"error"` and the caller gets a 502 before the stream opens (or an SSE `error` event if it had already opened) — never a fabricated answer. The exceptions are explicitly the non-essential paths: a search-cache outage or a memory-recall failure is **fail-soft** (serve a correct, uncached, un-personalised answer), because correctness never depended on them.
 
 ## State
 
-- **Authoritative (in Atlas), owned by the agent/worker:** `threads`, `messages`, `memories`
-  (with embeddings), `spaces`, `documents`, `chunks` (with embeddings + page/heading/line
-  locators), `jobs`, `requests`, and the GridFS `uploads` bucket.
-- **Cache / disposable:** the `searchCache` collection (rows expire via a TTL index; deleting it
-  only costs a re-search) and the in-process **LRU** in front of it (pure speed, lost on restart,
-  and that is harmless). `searchCached: true` is reported only when *every* search in a request was
-  a hit. The `runs/` files are an append-only audit log (mirrored to a `runs` collection once
-  deployed, since a container's disk is not durable).
-- **The "written but not yet searchable" story:** Atlas Search indexes are eventually consistent,
-  so upserting chunks does not make them findable the same instant. The worker therefore runs a
-  **read-your-write probe** — it queries the vector index for the document it just wrote and only
-  flips the status to `indexed` once one of its own chunks comes back. Until then the document sits
-  at `embedding`/`pct < 100`, so an answer can never cite a document that is not actually
-  retrievable yet.
+Authoritative state lives in Atlas. The `messages` collection is the record that matters most: it is the durable, per-user, deploy-surviving source that `/stats` and the daily deep-cap both count from — precisely because the disk run logs are keyed by request id, not queryable per user. `documents`, `chunks`, `spaces`, `memories`, `threads`, `requests`, and the GridFS uploads are likewise authoritative and owned by the agent. Everything else is a cache you could delete without losing anything but latency and money: the **`searchCache` collection** (a TTL index on `expiresAt` with `expireAfterSeconds:0` expires rows automatically) and the **in-process LRU** in front of it — the LRU carries the same `expiresAt` as its row so the two tiers can't disagree, and only cache *misses* are charged for search cost. The **run logs** are the canonical per-*answer* record but are observability, not a store you query. The consistency story is the sharp edge: Atlas Search is **eventually consistent**, so a chunk that has been upserted is not yet searchable. The worker closes that gap with a **read-your-write probe** — after writing a document's chunks it queries the vector index for one it just wrote, using that chunk's own embedding (whose nearest neighbour is itself), filtered by `spaceId`+`userId`, and only flips the document to `indexed` once the probe returns (retrying with backoff). So `indexed` means "actually retrievable," which is what makes the client's poll-until-indexed contract non-racy.
 
 ## Trade-offs
 
-Four decisions a reasonable engineer might have made differently.
+**Atlas Vector Search instead of a dedicated vector store (Pinecone/Qdrant/pgvector).** The embedding, the chunk text, and its page locator live in one document, `spaceId`/`userId` are plain in-stage filters, and a citation is one document read with no second store to keep in sync — at the cost of the free tier's hard limit of three search indexes total (two vector + one text = exactly three, none to spare) and the eventual-consistency lag that forced the read-your-write probe.
 
-1. **Atlas Vector Search instead of a dedicated vector store (Pinecone/Qdrant).** Keeping the
-   embedding, the chunk text, its locator, and `spaceId` in one document makes a citation a single
-   read and makes per-Space isolation a plain filter — no second store to keep in sync. The cost:
-   Atlas M0 caps me at three search indexes and its indexes are only eventually consistent, which
-   is exactly why the probe above has to exist.
-2. **A hand-rolled agent loop instead of a framework (LangChain/LlamaIndex).** The assignment
-   grades the *honesty of the trajectory* — every step traced, `terminated` truthful, tools gated
-   by depth. A framework hides precisely those seams, so I gave up its free plumbing to keep
-   control of them.
-3. **Hybrid retrieval (vector + text fused with RRF) instead of vector-only.** Vector search alone
-   misses exact-keyword and code-like queries; fusing a text index recovers them and lifts recall.
-   The cost is a second index and the fusion step, against the M0 index budget.
-4. **(The one I'm unsure about) An in-process LRU in front of the Mongo search cache.** On a single
-   instance this gives near-instant repeat hits. But if I ever scale the agent to more than one
-   instance, the LRUs don't share, so two instances can both miss and re-search the same query, and
-   the real hit rate drops toward whatever the Mongo tier alone provides. At course scale it's one
-   instance and the Mongo tier still catches cross-instance repeats, so I kept it — but I don't
-   think it survives horizontal scaling without a shared cache (Redis), and I haven't proven that
-   either way.
+**A hand-rolled agent loop instead of LangChain/LlamaIndex.** We own every step — the exact SSE trace, the caps, the honest `terminated` value, the deterministic first search that saves a whole LLM round-trip, and depth-gated tools a framework would hide — at the cost of writing the plumbing ourselves.
+
+**One container on Render's free tier instead of two independently-deployed private services.** The original plan was a public gateway and a *separately deployed* private agent (Fly's 6PN network). The deployed system instead runs gateway + agent + worker as three processes in one free Render container, with the agent private on loopback. We gained zero cost, no credit card, and a still-unreachable agent — and gave up crash-isolation and independent deploys between the three processes, and accepted free-tier cold starts (~50s) plus per-request Gemini latency that pushes the two *timing* SLA rows above their budget. That timing miss is provider- and tier-bound, not architectural, and is documented rather than hidden.
+
+**(Unsure) The in-process LRU in front of the Mongo cache — and the in-memory rate-limit window.** On the single free instance both are ideal: the LRU absorbs hot repeats with zero network (and alone clears the benchmark's ≥50%-repeat workload), and the per-user counter is cheap. But neither is shared across replicas, so the moment this scales past one instance both should move to a shared store. Kept as-is for a single-instance deploy; flagged as the decision I'm least certain survives growth.
