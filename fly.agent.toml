@@ -1,0 +1,48 @@
+# LUMINA agent — PRIVATE Fly app. Deploy from the repo root: `fly deploy -c fly.agent.toml`.
+#
+# Privacy: this app has NO public IP allocated (release any that `fly launch` created — see DEPLOY.md).
+# It is reachable ONLY from the gateway over Fly's 6PN private network at lumina-agent.internal:8000.
+# That is the whole isolation story: the keys live behind a service the internet cannot address.
+app = "lumina-agent"
+primary_region = "bom"  # Mumbai — co-located with the Atlas M0 (AWS ap-south-1) to cut DB latency
+
+[build]
+  dockerfile = "backend/agent/Dockerfile"
+
+# Non-secret config. The SECRETS (MONGODB_URI, GOOGLE_API_KEY, TAVILY_API_KEY) are set out-of-band
+# with `fly secrets set` and injected at runtime — never written here, never baked into the image.
+[env]
+  PORT_AGENT = "8000"
+  LLM_PROVIDER = "google"
+  LLM_MODEL = "gemini-3.5-flash-lite"
+  EMBEDDING_MODEL = "gemini-embedding-001"
+  SEARCH_PROVIDER = "tavily"
+  VECTOR_BACKEND = "atlas-vector-search"
+  MONGODB_DB = "lumina"
+  DEEP_DAILY_CAP = "5"
+
+# Two processes off one image: the HTTP agent and the jobs worker (M7). They share the image and
+# every secret; the worker just runs a different entrypoint.
+[processes]
+  app = "node dist/index.js"
+  worker = "node dist/worker.js"
+
+# Internal-only TCP service for the `app` process: internal_port with NO [[services.ports]] means
+# no public listener is ever created — the port is reachable only on the private network. Kept
+# always-on (min 1, no autostop) so the agent holds its Atlas connection and the worker keeps polling.
+[[services]]
+  internal_port = 8000
+  protocol = "tcp"
+  processes = ["app"]
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["app", "worker"]

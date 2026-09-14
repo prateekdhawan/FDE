@@ -1,0 +1,17 @@
+# Never ship build junk, local state, or SECRETS into an image.
+# .env is the important one: provider keys live there and must NEVER be baked into a layer —
+# Fly injects them as runtime secrets instead (fly secrets set). An image can be pulled/inspected.
+.env
+.env.*
+node_modules
+**/node_modules
+dist
+**/dist
+web/dist
+.git
+.gitignore
+runs
+reports
+*.log
+npm-debug.log*
+.DS_Store

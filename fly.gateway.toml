@@ -1,0 +1,32 @@
+# LUMINA gateway — PUBLIC Fly app (the only internet-facing service). Deploy from the repo root:
+# `fly deploy -c fly.gateway.toml`. Holds NO provider key.
+app = "lumina-gateway"
+primary_region = "bom"  # Mumbai — same region as the private agent it proxies to
+
+[build]
+  dockerfile = "backend/gateway/Dockerfile"
+
+[env]
+  PORT_GATEWAY = "8787"
+  # The private agent, addressed over the 6PN network (see fly.agent.toml). Not a secret.
+  AGENT_URL = "http://lumina-agent.internal:8000"
+  # CORS_ORIGINS is set AFTER the Vercel UI exists, to that exact origin (see DEPLOY.md). Setting it
+  # to the real UI origin (not "*") is what keeps a random site from driving this API from a browser.
+
+# Public HTTPS on 443 → the process on 8787. force_https redirects http→https. auto start/stop lets
+# a personal app scale to zero when idle; set min_machines_running=1 before grading to avoid a cold
+# start on the eval's first request.
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+# NB: deliberately NO HTTP health check on /health here — the gateway's /health returns 503 whenever
+# the agent is down (honest nesting), and a Fly check reading that would stop routing to a gateway
+# that is itself perfectly alive. Machine-level liveness is enough for a single instance.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
