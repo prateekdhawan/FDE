@@ -142,10 +142,11 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(502).json({ error: err.message, status: 502 });
 });
 
-app.listen(env.port, () => {
+app.listen(env.port, env.bindHost, () => {
   log.info(
     {
       port: env.port,
+      bindHost: env.bindHost,
       model: env.llmModel,
       searchProvider: env.searchProvider,
       vectorStore: env.vectorBackend,

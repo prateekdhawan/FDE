@@ -1,0 +1,40 @@
+# LUMINA — Render Blueprint (free tier). ONE Docker web service running gateway + agent + worker
+# (see render-start.mjs). Only the gateway is public (on $PORT); the agent stays on loopback:8000.
+#
+# Secrets (sync:false below) are NOT stored in this file — set them once in the Render dashboard:
+#   MONGODB_URI, GOOGLE_API_KEY, TAVILY_API_KEY, and (after the Vercel UI deploys) CORS_ORIGINS.
+services:
+  - type: web
+    name: lumina
+    runtime: docker
+    dockerfilePath: ./Dockerfile.render
+    plan: free
+    region: singapore # closest free region to the Atlas M0 in AWS ap-south-1 (Mumbai)
+    branch: main
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LLM_PROVIDER
+        value: google
+      - key: LLM_MODEL
+        value: gemini-3.5-flash-lite
+      - key: EMBEDDING_MODEL
+        value: gemini-embedding-001
+      - key: SEARCH_PROVIDER
+        value: tavily
+      - key: VECTOR_BACKEND
+        value: atlas-vector-search
+      - key: MONGODB_DB
+        value: lumina
+      - key: DEEP_DAILY_CAP
+        value: "5"
+      # --- secrets: values live ONLY in the Render dashboard (never in this repo) ---
+      - key: MONGODB_URI
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: CORS_ORIGINS # set to the Vercel UI origin after step 4
+        sync: false

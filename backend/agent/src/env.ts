@@ -11,6 +11,10 @@ const num = (v: string | undefined, fallback: number) => {
 };
 export const env = {
   port: num(process.env.PORT_AGENT ?? process.env.PORT, 8000),
+  // Bind address. Default 0.0.0.0 (local dev). On the single-container Render deploy the launcher
+  // sets AGENT_BIND_HOST=127.0.0.1 so the agent is reachable ONLY over loopback by the co-located
+  // gateway — never on any external interface (Render routes nothing but the gateway's $PORT).
+  bindHost: process.env.AGENT_BIND_HOST ?? '0.0.0.0',
   mongoUri: process.env.MONGODB_URI ?? '',
   mongoDb: process.env.MONGODB_DB ?? 'lumina',
   vectorBackend: (process.env.VECTOR_BACKEND ?? 'atlas-vector-search') as

@@ -1,0 +1,32 @@
+# LUMINA — single-image build for the Render free tier (R1 topology: gateway + agent + worker in
+# ONE container, launched by render-start.mjs). Build context is the repo ROOT.
+#
+# Why one image: Render's free tier has no private service and no background worker, and exposes
+# only one public port. So we co-locate all three processes; the launcher keeps the agent on
+# loopback (private) and puts only the gateway on $PORT (public). Secrets are Render env vars read
+# at runtime by the agent process — never baked in (.env is .dockerignore'd).
+FROM node:24-slim
+WORKDIR /app
+
+# 1) Install the whole workspace. Manifests first for layer caching; npm ci needs every workspace's
+#    manifest present to validate the shared lockfile. --include=dev guarantees TypeScript is present
+#    for the build even though the service RUNS with NODE_ENV=production (set by Render at runtime).
+COPY package.json package-lock.json ./
+COPY packages/contract/package.json packages/contract/
+COPY backend/agent/package.json backend/agent/
+COPY backend/gateway/package.json backend/gateway/
+COPY web/package.json web/
+RUN npm ci --include=dev
+
+# 2) Copy the sources this deploy needs (NOT web/ — the UI is served by Vercel) and build them.
+#    Contract first: both services import the built @lumina/contract.
+COPY packages/contract packages/contract
+COPY backend/agent backend/agent
+COPY backend/gateway backend/gateway
+RUN npm run build -w @lumina/contract \
+ && npm run build -w @lumina/agent \
+ && npm run build -w @lumina/gateway
+
+# 3) The launcher runs all three processes. Render provides $PORT at runtime; no EXPOSE needed.
+COPY render-start.mjs ./
+CMD ["node", "render-start.mjs"]
