@@ -19,7 +19,10 @@ COPY web/package.json web/
 RUN npm ci --include=dev
 
 # 2) Copy the sources this deploy needs (NOT web/ — the UI is served by Vercel) and build them.
-#    Contract first: both services import the built @lumina/contract.
+#    Contract first: both services import the built @lumina/contract. The shared base tsconfig is
+#    copied too — every workspace tsconfig does "extends": "../../tsconfig.base.json", so without it
+#    tsc can't read the compiler options (fails TS5083, then falls back to an ancient target).
+COPY tsconfig.base.json ./
 COPY packages/contract packages/contract
 COPY backend/agent backend/agent
 COPY backend/gateway backend/gateway
