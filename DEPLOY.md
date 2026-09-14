@@ -1,125 +1,131 @@
 # LUMINA — Deploy runbook (M12)
 
-Target topology (from PLAN.md, fixed):
+**Status: LIVE and verified (2026-09-14).**
+
+| Piece | URL | Host |
+| --- | --- | --- |
+| UI (static) | https://lumina-web-two-orpin.vercel.app | Vercel |
+| API (gateway) | https://lumina-8cqp.onrender.com | Render (free) |
+
+Deployed topology (**R1** — the free tier has no private service and no separate worker, and exposes
+only one public port, so all three processes share ONE Render container):
 
 ```
-Vercel (static UI)  ──HTTPS──▶  Fly: lumina-gateway (PUBLIC edge, no keys)
-                                      │  Fly 6PN private network
-                                      ▼
-                                Fly: lumina-agent (PRIVATE, holds all keys) ──▶ Gemini · Tavily · Atlas
+Vercel (static UI)  ──HTTPS──▶  Render web service  "lumina"  (one container)
+  VITE_API_URL bakes                 ├── gateway  0.0.0.0:$PORT   PUBLIC edge, holds NO keys
+  in the gateway URL                 ├── agent    127.0.0.1:8000  PRIVATE (loopback only), holds all keys
+                                     └── worker   (no port)       M7 jobs worker
+                                              │
+                                              ▼  agent → providers
+                                        Gemini · Tavily · Atlas
 ```
 
-- **UI → gateway** over the public internet (the browser knows only the gateway's HTTPS URL, via `VITE_API_URL`).
-- **Gateway → agent** over Fly's private 6PN network at `lumina-agent.internal:8000`. The agent has **no public IP**.
-- **Secrets** live only as Fly secrets on the agent. The gateway holds none. `.env` is `.dockerignore`d, never baked into an image.
+- **UI → gateway** over the public internet; the browser knows only the gateway's HTTPS URL (`VITE_API_URL`, a public build-time value — never a key).
+- **gateway → agent** over **loopback** (`http://127.0.0.1:8000`). The agent is never internet-routable: Render routes traffic **only** to the process bound to `$PORT` (the gateway). This is the whole "agent not public" guarantee — see [render-start.mjs](render-start.mjs) and [backend/agent/src/env.ts](backend/agent/src/env.ts) (`AGENT_BIND_HOST=127.0.0.1`).
+- **Secrets** live only as Render env vars, read at runtime by the agent process. The gateway holds none. `.env` is `.dockerignore`d, so no key is ever baked into an image.
+- **Why the UI is on Vercel, not served by the gateway:** the gateway's SPA fallback regex in [backend/gateway/src/index.ts](backend/gateway/src/index.ts) excludes `/evals`, so a hard-refresh on `/evals` would 404 if the gateway served the UI. Vercel's SPA rewrite (below) handles every route.
 
-> `fly deploy` and `vercel` both build **remotely**, so local Docker is not required.
+> Render builds the image **remotely** from the GitHub repo; Vercel builds **remotely** too. No local Docker required.
 
 ---
 
-## 0. One-time: install CLIs + authenticate
+## 0. One-time: accounts + data access
+
+- **GitHub:** code lives on a personal repo (Render deploys from it). This project is kept isolated from any work account.
+- **Render:** personal account, free tier. No card required.
+- **Vercel:** personal account. `npm i -g vercel`, then `vercel login` (browser).
+- **Atlas:** **Network Access → allow `0.0.0.0/0`** (Render egress IPs vary), and confirm the DB user in `MONGODB_URI` can read/write the `lumina` DB. (Also in SETUP.md.)
+
+---
+
+## 1. Push the code to GitHub
+
+Render deploys from a Git branch, so the repo must be current:
 
 ```bash
-# flyctl (Windows PowerShell):
-#   pwsh -c "iwr https://fly.io/install.ps1 | iex"   then add %USERPROFILE%\.fly\bin to PATH
-# vercel:
-npm i -g vercel
-
-fly auth login       # opens a browser — personal Fly account
-vercel login         # opens a browser — personal Vercel account
+git push origin main
 ```
 
-Atlas: **Network Access → allow `0.0.0.0/0`** (Fly egress IPs vary), and confirm the DB user in `MONGODB_URI` can read/write the `lumina` DB. (Already noted in SETUP.md.)
+The repo root carries the three deploy files Render/Vercel read:
+[render.yaml](render.yaml) (Blueprint), [Dockerfile.render](Dockerfile.render) (image), [render-start.mjs](render-start.mjs) (launcher), and [vercel.json](vercel.json) (UI build).
 
 ---
 
-## 1. Deploy the agent FIRST (private) — the gateway needs a target
+## 2. Deploy the backend on Render (Blueprint)
+
+1. Render dashboard → **New → Blueprint** → pick the GitHub repo. Render reads [render.yaml](render.yaml) and creates the `lumina` web service (Docker, `plan: free`, `region: singapore` — closest free region to the Atlas M0 in Mumbai; `autoDeploy: true`).
+2. **Set the secrets** (declared `sync: false` in the Blueprint, so Render does **not** create them — a human adds them in the dashboard). Service → **Environment** → add:
+   - `MONGODB_URI`
+   - `GOOGLE_API_KEY`
+   - `TAVILY_API_KEY`
+   - (`CORS_ORIGINS` — leave for step 4, once the Vercel URL exists.)
+3. Render builds [Dockerfile.render](Dockerfile.render) and starts [render-start.mjs](render-start.mjs) (agent on loopback → worker → gateway on `$PORT`).
+
+Verify the public gateway once it's **Live**:
+
+```bash
+GW=https://lumina-8cqp.onrender.com
+curl -s $GW/health                                    # 200; names model/provider/vector + "db":"ok"  (db:ok proves Atlas from Render)
+curl -s -o /dev/null -w '%{http_code}\n' $GW/stats    # 401 (no X-User-Id — auth gate works)
+curl -s -H 'x-user-id: u_smoke' $GW/stats             # 200 StatsResponse
+```
+
+> **`autoDeploy`:** every `git push` to `main` triggers a rebuild. To ship a fix, push — no CLI step.
+
+---
+
+## 3. Deploy the UI on Vercel (from the repo ROOT)
+
+The UI imports `@lumina/contract` and extends the root `tsconfig.base.json`, so a `web/`-only deploy fails to build. Deploy from the **repo root** using [vercel.json](vercel.json) (installs the workspace, builds `contract` → `web`, outputs `web/dist`, SPA rewrite):
 
 ```bash
 # From the repo root.
-fly apps create lumina-agent
-
-# Secrets (values come from .env — never printed). These three are all the agent needs:
-fly secrets set -a lumina-agent \
-  MONGODB_URI='...'      \
-  GOOGLE_API_KEY='...'   \
-  TAVILY_API_KEY='...'
-
-fly deploy -c fly.agent.toml         # builds backend/agent/Dockerfile, starts app + worker processes
-
-# Make it truly private: release any public IP fly may have allocated.
-fly ips list -a lumina-agent
-fly ips release <each-public-ip> -a lumina-agent     # the .internal address always remains
-
-# Sanity: exec into the machine and hit its own /health (no public route exists, by design).
-fly ssh console -a lumina-agent -C "curl -s localhost:8000/health"
-# → {"status":"ok","model":"gemini-3.5-flash-lite",...,"db":"ok"}   (db:ok proves Atlas from Fly)
+vercel link --yes --project lumina-web        # names the project (dir name has a capital → invalid, so set it explicitly)
+vercel --prod --yes \
+  --build-env VITE_API_URL=https://lumina-8cqp.onrender.com   # bake the PUBLIC gateway URL into the bundle
+# → https://lumina-web-two-orpin.vercel.app
 ```
 
-The agent runs two Fly processes from one image: `app` (HTTP) and `worker` (the M7 jobs worker). Both share the secrets.
-
----
-
-## 2. Deploy the gateway (public)
-
-```bash
-fly apps create lumina-gateway
-fly deploy -c fly.gateway.toml       # builds backend/gateway/Dockerfile
-# → public URL, e.g. https://lumina-gateway.fly.dev
-
-# Verify the private hop works (gateway → agent.internal):
-curl -s https://lumina-gateway.fly.dev/health
-# → 200 {"status":"ok",...} when the agent is up (the gateway nests the agent's health)
-```
-
-`AGENT_URL=http://lumina-agent.internal:8000` is already in `fly.gateway.toml` — no secret needed.
-
----
-
-## 3. Deploy the UI (Vercel), pointed at the gateway
-
-```bash
-cd web
-vercel link                                    # link/create the Vercel project
-vercel env add VITE_API_URL production         # paste: https://lumina-gateway.fly.dev
-vercel --prod                                   # build + deploy; uses web/vercel.json (SPA rewrite)
-# → https://<project>.vercel.app
-```
-
-`VITE_API_URL` is a **public** build-time value (the gateway's URL) — it is NOT a secret and must never be a provider key.
+`VITE_API_URL` is a **public** build-time value (the gateway's URL) — never a provider key. Confirm it baked in: the deployed JS bundle should contain `https://lumina-8cqp.onrender.com` and no `localhost`.
 
 ---
 
 ## 4. Close the CORS loop, then verify end to end
 
-```bash
-# Tell the gateway which browser origin may call it (not "*"): the Vercel URL from step 3.
-fly secrets set -a lumina-gateway CORS_ORIGINS='https://<project>.vercel.app'   # restarts the gateway
+The gateway allows only the browser origin(s) in `CORS_ORIGINS` (never `*`). Add it on Render:
 
-# Before grading, keep the gateway warm so the eval's first request isn't a cold start:
-fly scale count 1 -a lumina-gateway
-# (fly.gateway.toml ships min_machines_running=0 for cost; bump to 1 for the eval window.)
-```
+1. Service → **Environment** → **Add Environment Variable** → key `CORS_ORIGINS`, value `https://lumina-web-two-orpin.vercel.app` (no trailing slash — must match the browser `Origin` exactly) → **Save** (auto-redeploys).
 
-End-to-end checks against the **public gateway** (what the grader hits):
+Verify CORS from the CLI — the UI sends `x-user-id` on **every** request, which forces a preflight, so test with that header:
 
 ```bash
-GW=https://lumina-gateway.fly.dev
-curl -s $GW/health                                             # 200, names model/provider/vector/db
-curl -s -o /dev/null -w '%{http_code}\n' $GW/stats             # 401 (no X-User-Id)
-curl -s -H 'x-user-id: u_smoke' $GW/stats                      # 200 StatsResponse
-# Full ask (SSE) — trace* → sources → token* → done, sources before first token:
-TID=$(curl -s -H 'x-user-id: u_smoke' -H 'content-type: application/json' -d '{}' $GW/threads | ... )
-curl -sN -H 'x-user-id: u_smoke' -H 'content-type: application/json' \
-  -d '{"query":"latest on ..."}' "$GW/threads/$TID/ask"
+GW=https://lumina-8cqp.onrender.com
+ORIGIN=https://lumina-web-two-orpin.vercel.app
+# Preflight for a GET /health (UI sends x-user-id everywhere):
+curl -s -i -X OPTIONS -H "Origin: $ORIGIN" \
+  -H 'Access-Control-Request-Method: GET' -H 'Access-Control-Request-Headers: x-user-id' \
+  $GW/health | grep -i '^access-control-'
+# → access-control-allow-origin: <ORIGIN>  and  access-control-allow-headers: x-user-id
 ```
 
-Then open the Vercel URL in a browser, run a query, and confirm streaming + citations render. `/evals` on the Vercel URL should load (SPA rewrite) and pull `/evals/report.json` from the gateway.
+Then open the Vercel URL in a browser, run a query, and confirm: the header badge is green (`… · db ok`), **Sources** populate with real links, the answer streams token-by-token, and the **Trace** shows the tool calls. `/evals` (hard refresh) loads via the SPA rewrite and pulls `/evals/report.json` from the gateway.
+
+**Verified run (2026-09-14):** query *"What is retrieval-augmented generation?"* → `web_search` → `fetch_page`, grounded answer with a real `cloud.google.com` citation, `done{terminated:"done", cost $0.0051}`.
 
 ---
 
-## Notes / cost / scaling
+## Notes / gotchas / cost
 
-- **Cost:** agent = 2 always-on machines (app + worker); gateway = 1 (scale-to-zero unless warmed). All `shared-cpu-1x`. Trim later with a multi-stage Dockerfile (`npm ci --omit=dev` runner) if image size matters.
-- **Multi-instance:** the gateway rate-limit is in-memory (per instance); the deep-cap is in Atlas (shared). If the gateway scales >1, move the rate-limit counter to a shared store (noted in DESIGN.md).
-- **`.internal` vs `.flycast`:** single agent instance uses `.internal` (per-instance 6PN DNS). To scale the agent >1, allocate a private IP (`fly ips allocate-v6 --private -a lumina-agent`) and switch `AGENT_URL` to `http://lumina-agent.flycast:8000` (load-balanced).
+- **Free-tier cold start (expected, not a bug):** the service sleeps after ~15 min idle and takes ~50s to wake. The UI health check is a **one-shot** `useEffect([], …)` in [web/src/App.tsx](web/src/App.tsx) with no retry, so on a cold start the first `/health` times out and the badge sticks at **"gateway unreachable"** until you reload the page. `web/` is DO-NOT-EDIT, so this is documented, not patched. **Warm the service before an eval** by hitting `/health` first.
+- **Latency caveat (documented in DESIGN.md):** on the free tier, TTFT runs ~3–13s warm and ~27s on a cold + `fetch_page` request — **above the 2500ms SLA**. This is the accepted cost of staying free (Gemini free-tier + Render sleep). A warm quick-search is the fast path.
+- **Cost:** one `free` web service. $0 infra; provider spend only (~$0.005 / quick ask).
+- **Isolation:** personal GitHub / Render / Vercel accounts only; no work infra, no internal endpoints, no secret reachable from the browser, agent never public.
+- **Multi-instance:** free tier is single-instance, so the in-memory gateway rate-limit is fine; the deep-cap is in Atlas (shared). If ever scaled >1, move the rate-limit counter to a shared store (noted in DESIGN.md).
+
+---
+
+## Appendix — Fly.io (alternative target, NOT deployed)
+
+The repo also carries a two-app Fly.io config ([fly.agent.toml](fly.agent.toml), [fly.gateway.toml](fly.gateway.toml), [backend/agent/Dockerfile](backend/agent/Dockerfile), [backend/gateway/Dockerfile](backend/gateway/Dockerfile)) that maps the same "public gateway / private agent" split onto Fly's 6PN private network (agent at `lumina-agent.internal:8000`, no public IP). It is a valid future target but was **not** used for this submission (Fly requires a card; Render's free tier does not).
+
+**Known caveat if you revive it:** the Fly Dockerfiles have the same latent bug this Render build hit — they never `COPY tsconfig.base.json` (every workspace tsconfig extends `../../tsconfig.base.json`), so `tsc` fails `TS5083`. Add that copy before the build step (see how [Dockerfile.render](Dockerfile.render) does it) before trusting the Fly path.
