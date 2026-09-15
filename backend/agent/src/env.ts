@@ -43,7 +43,15 @@ export const env = {
 
   logLevel: process.env.LOG_LEVEL ?? 'info',
   /** Where the per-answer run logs land. quality/check.mjs reads this folder. */
-  runsDir: resolve(process.cwd(), '../../runs')
+  runsDir: resolve(process.cwd(), '../../runs'),
+  /**
+   * The built Product Evaluation served at GET /evals/report.json (the /evals page renders it).
+   * eval/build-report.mjs writes reports/report.json, but reports/ is .gitignored (so it never
+   * ships in the Render image) and its name trips the eval's Gate-0 "no artifacts staged" regex.
+   * The deployable copy therefore lives at the repo root as eval-report.json — committed, and a
+   * name Gate 0 does not flag. Override with EVAL_REPORT_PATH.
+   */
+  evalReportPath: process.env.EVAL_REPORT_PATH ?? resolve(process.cwd(), '../../eval-report.json')
 } as const;
 
 /** Never log or return these. /health names the model; it never echoes a key. */

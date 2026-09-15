@@ -43,7 +43,7 @@
 import 'express-async-errors';
 import express from 'express';
 import pino from 'pino';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { HealthResponse, ROUTES } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
@@ -84,6 +84,25 @@ app.get('/health', async (_req, res) => {
     ai: { status: 'ok' }
   };
   res.status(dbStatus === 'ok' ? 200 : 503).json(body);
+});
+
+// ---------------------------------------------------------------- M13: /evals/report.json
+
+// The Product Evaluation the /evals page renders (contract auth:false — the grader's tooling pulls
+// it with no X-User-Id, so it must not sit behind requireUser). Written by eval/build-report.mjs and
+// committed to the image at eval-report.json (see env.evalReportPath for why not reports/). Served
+// verbatim as JSON; a missing file is an honest 404 with the command to produce it, never a fake
+// report. The file is read per request (a few KB) so a redeploy's new report is picked up without
+// caching a stale one in memory.
+app.get('/evals/report.json', (_req, res) => {
+  try {
+    res.type('application/json').send(readFileSync(env.evalReportPath, 'utf8'));
+  } catch {
+    res.status(404).json({
+      error: 'no evaluation report yet — run `node eval/build-report.mjs --out eval-report.json` and redeploy',
+      status: 404
+    });
+  }
 });
 
 // ---------------------------------------------------------------- M4: threads & messages

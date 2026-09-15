@@ -52,25 +52,48 @@ export async function proxyToAgent(req: Request, res: Response): Promise<void> {
   const controller = new AbortController();
   res.on('close', () => controller.abort());
 
+  // A co-located agent that is momentarily too busy to ACCEPT a connection — the free tier's
+  // shared CPU stalls the agent's event loop under concurrent load — rejects the fetch at connect
+  // time (undici's ~10s connect timeout). That is transient, not a dead agent, so retry the connect
+  // a bounded number of times before declaring it unreachable. Two guards keep this honest:
+  //   - Pre-response only. We are still before any byte is sent, so a retry cannot corrupt a stream;
+  //     a mid-stream tear-down is handled below and is never retried (it can't be replayed).
+  //   - Re-sendable body only. The multipart upload body is a one-shot stream (duplex:'half') that
+  //     the first attempt consumes, so uploads do not retry; GET/DELETE and the re-serialised JSON
+  //     POST body are safe to send again. A connect timeout means the agent never received the
+  //     request, so re-sending starts no duplicate work.
+  // A truly-down agent still fails loud with 502 once the attempts are spent (rule A1).
+  const maxAttempts = duplex === 'half' ? 1 : 3;
   let upstream: Awaited<ReturnType<typeof fetch>> | undefined;
-  try {
-    const init: RequestInit & { duplex?: 'half' } = {
-      method: req.method,
-      headers,
-      signal: controller.signal
-    };
-    if (body !== undefined) {
-      init.body = body;
-      if (duplex) init.duplex = duplex;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const init: RequestInit & { duplex?: 'half' } = {
+        method: req.method,
+        headers,
+        signal: controller.signal
+      };
+      if (body !== undefined) {
+        init.body = body;
+        if (duplex) init.duplex = duplex;
+      }
+      upstream = await fetch(target, init);
+      break;
+    } catch (err) {
+      if (controller.signal.aborted) return; // client gone; nothing to send
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        // Brief backoff to let the starved event loop catch up, then retry the connect.
+        await new Promise((r) => setTimeout(r, 300 * attempt));
+      }
     }
-    upstream = await fetch(target, init);
-  } catch (err) {
-    if (controller.signal.aborted) return; // client gone; nothing to send
-    // Agent unreachable or it tore the connection before replying: fail loud with 502.
+  }
+  if (!upstream) {
+    // Agent unreachable after every attempt, or it tore the connection before replying: fail loud.
     if (!res.headersSent) {
       res
         .status(502)
-        .json({ error: `agent unreachable: ${(err as Error).message}`, status: 502, requestId });
+        .json({ error: `agent unreachable: ${(lastErr as Error).message}`, status: 502, requestId });
     }
     return;
   }
