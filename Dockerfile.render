@@ -32,4 +32,11 @@ RUN npm run build -w @lumina/contract \
 
 # 3) The launcher runs all three processes. Render provides $PORT at runtime; no EXPOSE needed.
 COPY render-start.mjs ./
+
+# 4) The pre-built Product Evaluation, served verbatim by the agent at GET /evals/report.json
+#    (env.evalReportPath resolves to /app/eval-report.json from the agent's cwd). It is a generated
+#    artifact — reports/ and runs/ are .dockerignore'd, so the report is committed at the repo root
+#    and copied here. Copied LAST so regenerating it (e.g. adding the demo video URL) rebuilds only
+#    this one cheap layer, never the npm ci / tsc layers above.
+COPY eval-report.json ./
 CMD ["node", "render-start.mjs"]

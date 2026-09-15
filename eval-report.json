@@ -1,0 +1,505 @@
+{
+  "assignment": "Assignment 1: LUMINA",
+  "student": "Prateek Dhawan",
+  "deployedAt": "2026-09-15T05:15:23.068Z",
+  "runNotes": "gemini-3.5-flash-lite · tavily · Atlas M0 · Render free tier (512MB / ~0.1 shared CPU). Latency & error-rate SLA misses reflect free-tier resource limits under concurrency-4, not logic: 0 dangling citations, fail-loud verified, all red lines clean.",
+  "design": {
+    "components": "LUMINA is two Express/TypeScript services plus a worker, one MongoDB Atlas database, and a static React UI. The **gateway** is the public edge: it is the only process the browser reaches, and in the deployed build it is the only one bound to a public port. The **agent** is the brain — the answer loop, its tools, retrieval, memory, deep search, and the only holder of provider keys; in the deploy it binds `127.0.0.1` only. The **jobs worker** is a third process from the same image with no listening port: it drains the ingest queue. Behind them sits one **Atlas** database of nine collections — `threads`, `messages`, `memories`, `spaces`, `documents`, `chunks`, `searchCache`, `jobs`, `requests` — plus **GridFS** for raw uploads and three Atlas Search indexes (two vector: `memories_vector`, `chunks_vector`; one text: `chunks_text`). The pieces that are *not* services still carry state and make decisions: the **`jobs` collection** is the durable work queue the worker polls and claims; the **search cache** is two tiers, an in-process LRU in front of the TTL'd `searchCache` collection; the **run logs** are one `runs/<requestId>.json` file per answer on the agent's disk (`runs/failing/` for capped or errored runs); and the **rate-limit window** is an in-memory per-user counter inside the gateway. The UI is static files on Vercel, with the gateway's public URL baked in at build time.",
+    "responsibilities": "The interesting part is the exclusions. The **gateway** is the *only* component allowed to talk to the browser, and it is the *only* one that is deliberately ignorant: it checks that an `X-User-Id` is present (401), validates request bodies against the shared contract schema (400), rate-limits the one expensive route (`POST …/ask`, 429), passes SSE through unbuffered, and returns 502 when it cannot reach the agent. It holds **no provider key** and makes no product decision — routing, retrieval, caps, and grounding are all downstream, so the public surface an attacker can reach has nothing secret behind it. The **agent** is the *only* key-holder (Gemini for chat and embeddings, Tavily for web search) and the *only* enforcer of the per-user daily deep-search cap — deliberately, because a cap on the edge is bypassed by calling the agent directly. It also re-checks ownership on every query, treating \"not yours\" as 404, never trusting that the edge scoped the data. The **worker** is the only component that runs the heavy ingest (parse → chunk → embed → probe → `indexed`); it shares the agent's image and keys but exposes no port.",
+    "communication": "The browser talks to the gateway over HTTP, and the ask route is **SSE** (`text/event-stream`) so tokens stream as they are written. The gateway talks to the agent over HTTP — on the deploy that hop is **loopback** (`http://127.0.0.1:8000`), since the free tier routes traffic only to the gateway's public port, which is what keeps the agent private without a separate network. For a streaming reply the gateway detects the upstream `text/event-stream` content-type and relays bytes **as they arrive**, flushing each chunk and setting `X-Accel-Buffering: no` (buffering here would silently blow the TTFT SLA); for everything else it forwards the agent's status and body **verbatim**, so a 400/404/413/429-with-`resetsAt`/502 survives the hop unchanged. The worker never talks HTTP: it **polls the `jobs` collection**, claiming one row atomically with `findOneAndUpdate` (`pending → running`, oldest first) so two workers can't grab the same job, and a stale-claim sweeper returns rows stuck `running` back to `pending` (up to three attempts, then `failed`). When the other end is down the rule is fail-loud at every layer: if the agent is unreachable the gateway returns **502**, never a 2xx over a dead upstream; if a provider throws inside the agent, the run ends `terminated:\"error\"` and the caller gets a 502 before the stream opens (or an SSE `error` event if it had already opened) — never a fabricated answer. The exceptions are explicitly the non-essential paths: a search-cache outage or a memory-recall failure is **fail-soft** (serve a correct, uncached, un-personalised answer), because correctness never depended on them.",
+    "state": "Authoritative state lives in Atlas. The `messages` collection is the record that matters most: it is the durable, per-user, deploy-surviving source that `/stats` and the daily deep-cap both count from — precisely because the disk run logs are keyed by request id, not queryable per user. `documents`, `chunks`, `spaces`, `memories`, `threads`, `requests`, and the GridFS uploads are likewise authoritative and owned by the agent. Everything else is a cache you could delete without losing anything but latency and money: the **`searchCache` collection** (a TTL index on `expiresAt` with `expireAfterSeconds:0` expires rows automatically) and the **in-process LRU** in front of it — the LRU carries the same `expiresAt` as its row so the two tiers can't disagree, and only cache *misses* are charged for search cost. The **run logs** are the canonical per-*answer* record but are observability, not a store you query. The consistency story is the sharp edge: Atlas Search is **eventually consistent**, so a chunk that has been upserted is not yet searchable. The worker closes that gap with a **read-your-write probe** — after writing a document's chunks it queries the vector index for one it just wrote, using that chunk's own embedding (whose nearest neighbour is itself), filtered by `spaceId`+`userId`, and only flips the document to `indexed` once the probe returns (retrying with backoff). So `indexed` means \"actually retrievable,\" which is what makes the client's poll-until-indexed contract non-racy.",
+    "tradeoffs": "**Atlas Vector Search instead of a dedicated vector store (Pinecone/Qdrant/pgvector).** The embedding, the chunk text, and its page locator live in one document, `spaceId`/`userId` are plain in-stage filters, and a citation is one document read with no second store to keep in sync — at the cost of the free tier's hard limit of three search indexes total (two vector + one text = exactly three, none to spare) and the eventual-consistency lag that forced the read-your-write probe.\n\n**A hand-rolled agent loop instead of LangChain/LlamaIndex.** We own every step — the exact SSE trace, the caps, the honest `terminated` value, the deterministic first search that saves a whole LLM round-trip, and depth-gated tools a framework would hide — at the cost of writing the plumbing ourselves.\n\n**One container on Render's free tier instead of two independently-deployed private services.** The original plan was a public gateway and a *separately deployed* private agent (Fly's 6PN network). The deployed system instead runs gateway + agent + worker as three processes in one free Render container, with the agent private on loopback. We gained zero cost, no credit card, and a still-unreachable agent — and gave up crash-isolation and independent deploys between the three processes, and accepted free-tier cold starts (~50s) plus per-request Gemini latency that pushes the two *timing* SLA rows above their budget. That timing miss is provider- and tier-bound, not architectural, and is documented rather than hidden.\n\n**(Unsure) The in-process LRU in front of the Mongo cache — and the in-memory rate-limit window.** On the single free instance both are ideal: the LRU absorbs hot repeats with zero network (and alone clears the benchmark's ≥50%-repeat workload), and the per-user counter is cheap. But neither is shared across replicas, so the moment this scales past one instance both should move to a shared store. Kept as-is for a single-instance deploy; flagged as the decision I'm least certain survives growth."
+  },
+  "gates": [],
+  "rubric": {
+    "total": 100,
+    "awarded": 57,
+    "automated": [
+      {
+        "id": "ui_lights_up_contract",
+        "label": "UI lights up & contract",
+        "points": 10,
+        "awarded": 10,
+        "status": "pass",
+        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 404 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names gemini-3.5-flash-lite · tavily · atlas-vector-search · db ok",
+        "rules": [
+          "C1"
+        ]
+      },
+      {
+        "id": "search_cited_answers",
+        "label": "Search & cited answers",
+        "points": 20,
+        "awarded": 7,
+        "status": "partial",
+        "evidence": "✗ citation grounding >= 0.95: citation grounding 0.785 over 65 verifiable citations, 0 dangling · ✗ search cache hits on repeats: search cache hit rate 31.3% on a workload that is 50% repeats",
+        "rules": [
+          "E2"
+        ]
+      },
+      {
+        "id": "memory",
+        "label": "Memory (thread + long-term)",
+        "points": 10,
+        "awarded": 7,
+        "status": "partial",
+        "evidence": "✗ recall crosses into a new thread: a new thread never called recall_memory — the preference cannot have crossed threads",
+        "rules": []
+      },
+      {
+        "id": "rag_documents",
+        "label": "RAG over documents",
+        "points": 15,
+        "awarded": 12,
+        "status": "partial",
+        "evidence": "✗ 202 accept p95 < 300ms: 202 accept p95 713ms",
+        "rules": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "id": "deep_search",
+        "label": "Deep search (plan, fan-out, merged citations, spend gate)",
+        "points": 15,
+        "awarded": 13,
+        "status": "partial",
+        "evidence": "✗ deep reads more than quick: worst deep/quick distinct-source ratio 0.33x (need 2x)",
+        "rules": [
+          "E2",
+          "B3",
+          "R2"
+        ]
+      },
+      {
+        "id": "performance_sla",
+        "label": "Performance & SLA gate",
+        "points": 10,
+        "awarded": 3,
+        "status": "partial",
+        "evidence": "✗ bench.mjs exits 0: 8 SLA target(s) missed · ✗ no error-severity quality failure: quality: 1 error(s), 1 warning(s) over 9 run log(s)",
+        "rules": [
+          "B1",
+          "B2",
+          "B3",
+          "A2",
+          "A3"
+        ]
+      },
+      {
+        "id": "observability",
+        "label": "Logging, tracing & stats",
+        "points": 5,
+        "awarded": 5,
+        "status": "pass",
+        "evidence": "✓ one X-Request-Id correlates both logs: 71/71 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=86 against 35 answers this run · ✓ every failed tool call carries an error (A1): A1: 9 run(s)",
+        "rules": [
+          "A1"
+        ]
+      }
+    ],
+    "manual": [
+      {
+        "id": "deep_search_quality",
+        "label": "Deep search quality (human half)",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "a grader asks the same question at both depths and reads both answers. The deep one has to be BETTER, not merely longer: broader coverage, sources the quick answer missed, sub-questions a person would actually have asked, and no padding. Judged by a person, never a model",
+        "rules": [
+          "E3",
+          "P1"
+        ]
+      },
+      {
+        "id": "human_gate_answer_quality",
+        "label": "Human gate & answer quality",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "/evals renders one successful and one failing trajectory in full, every step, with what each taught the learner; grader reads five sampled answers for concision, relevance, and honesty when retrieval is thin",
+        "rules": [
+          "P1"
+        ]
+      },
+      {
+        "id": "deploy_docs",
+        "label": "Deploy & docs",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "UI deployed on Vercel (the submitted URL) with /evals rendering GET /evals/report.json from this run; services on Fly.io or Vercel against an Atlas cluster; agent service not publicly reachable; no key or connection string reachable from the browser; the design section (five questions) and run notes render on the page",
+        "rules": []
+      }
+    ],
+    "redLines": [
+      {
+        "check": "no fabricated citation in the bench sample (E2)",
+        "ok": true,
+        "detail": "0 citation(s) resolved to nothing retrieved in that request"
+      },
+      {
+        "check": "no run that hit a cap reported as terminated=done (A2)",
+        "ok": true,
+        "detail": "9 run(s)"
+      },
+      {
+        "check": "plan_research never called from a quick search: depth is opted into, never drifted into (R2)",
+        "ok": true,
+        "detail": "75 quick run(s), none called plan_research"
+      },
+      {
+        "check": "no 2xx answer served on a provider exception (A1)",
+        "ok": true,
+        "detail": "9 run(s)"
+      }
+    ]
+  },
+  "bench": {
+    "ranAt": "2026-09-15T04:55:33.855Z",
+    "target": "https://lumina-8cqp.onrender.com",
+    "pass": false,
+    "sla": [
+      {
+        "metric": "ttft p95",
+        "target": 2500,
+        "actual": 28688,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "answer p95",
+        "target": 12000,
+        "actual": 29528,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "202 accept p95",
+        "target": 300,
+        "actual": 713,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "search p95 during ingest / idle",
+        "target": 1.3,
+        "actual": 3.749,
+        "unit": "×",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "recall@5",
+        "target": 0.7,
+        "actual": 0.933,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "search cache hit rate",
+        "target": 50,
+        "actual": 31.3,
+        "unit": "%",
+        "comparator": ">=",
+        "pass": false
+      },
+      {
+        "metric": "deep plan p95",
+        "target": 4000,
+        "actual": 2239,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "deep answer p95",
+        "target": 90,
+        "actual": 53.3,
+        "unit": "s",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "deep sub-questions (min)",
+        "target": 3,
+        "actual": 3,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "deep/quick source ratio (min)",
+        "target": 2,
+        "actual": 0.33,
+        "unit": "×",
+        "comparator": ">=",
+        "pass": false
+      },
+      {
+        "metric": "cost per deep answer",
+        "target": 0.35,
+        "actual": 0.0181,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "citation grounding",
+        "target": 0.95,
+        "actual": 0.785,
+        "unit": "",
+        "comparator": ">=",
+        "pass": false
+      },
+      {
+        "metric": "error rate",
+        "target": 0.01,
+        "actual": 0.4321,
+        "unit": "",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "cost per answer (quick)",
+        "target": 0.05,
+        "actual": 0.0021,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "sources before the first token",
+        "target": 1,
+        "actual": 1,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "citations with no matching source",
+        "target": 0,
+        "actual": 0,
+        "unit": "",
+        "comparator": "<=",
+        "pass": true
+      }
+    ],
+    "citationGrounding": 0.7846153846153846,
+    "recallAt5": 0.9333333333333333,
+    "retrievalRate": 1,
+    "errorRate": 0.43209876543209874,
+    "latency": {
+      "ttftP50Ms": 9927,
+      "ttftP95Ms": 28688,
+      "answerP50Ms": 10164,
+      "answerP95Ms": 29528,
+      "accept202P95Ms": 713
+    },
+    "cost": {
+      "meanCostPerAnswerUsd": 0.0021422948717948723,
+      "meanCostPerDeepAnswerUsd": 0.018116075000000002,
+      "declaredPriceTableUsd": 0.016379697674418603,
+      "projectedMonthlyUsd": 373.96728846153854,
+      "projectedMonthlyNoCacheUsd": 464.22948717948725
+    },
+    "searchCacheHitRatePct": 31.25,
+    "answers": 43
+  },
+  "quality": {
+    "project": "Assignment_1_Lumina",
+    "checkedAt": "2026-09-15T05:13:09.998Z",
+    "runs": 9,
+    "errors": 1,
+    "warnings": 1,
+    "results": [
+      {
+        "id": "C1",
+        "title": "Declared expectations are internally coherent",
+        "severity": "error",
+        "status": "pass",
+        "detail": "contract coherent"
+      },
+      {
+        "id": "A1",
+        "title": "Tool errors surface as errors",
+        "severity": "error",
+        "status": "pass",
+        "detail": "9 run(s)"
+      },
+      {
+        "id": "A2",
+        "title": "The loop terminates because it finished",
+        "severity": "error",
+        "status": "pass",
+        "detail": "9 run(s)"
+      },
+      {
+        "id": "A3",
+        "title": "No tool thrash",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "9 run(s)"
+      },
+      {
+        "id": "R1",
+        "title": "Required tools were actually called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "R2",
+        "title": "Forbidden tools were not called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "E1",
+        "title": "A gold set exists and is non-trivial",
+        "severity": "error",
+        "status": "pass",
+        "detail": "39 items"
+      },
+      {
+        "id": "E2",
+        "title": "Declared eval thresholds are met",
+        "severity": "error",
+        "status": "fail",
+        "detail": "citationGrounding=0.785 < 0.95; errorRate=0.4321 > 0.01"
+      },
+      {
+        "id": "E3",
+        "title": "A judge model may report, never block",
+        "severity": "warn",
+        "status": "manual",
+        "detail": "confirm no error-severity rule derives its verdict from a model"
+      },
+      {
+        "id": "B1",
+        "title": "Token budget respected",
+        "severity": "error",
+        "status": "pass",
+        "detail": "9 run(s)"
+      },
+      {
+        "id": "B2",
+        "title": "Latency budget respected",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "9 run(s)"
+      },
+      {
+        "id": "B3",
+        "title": "Cost budget respected",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "9 run(s)"
+      },
+      {
+        "id": "P1",
+        "title": "A human read a full trajectory",
+        "severity": "info",
+        "status": "manual",
+        "detail": "name the successful and failing trajectories you read end to end"
+      },
+      {
+        "id": "P2",
+        "title": "Every rule cites a real precedent",
+        "severity": "warn",
+        "status": "fail",
+        "detail": "10 rule(s) still lack a real precedent: C1, A2, A3, R1, R2, E1, E2, B1, B2, B3"
+      }
+    ]
+  },
+  "trajectories": {
+    "successful": {
+      "requestId": "req_90c588c8-3b4",
+      "query": "Compare the tradeoffs of REST versus GraphQL for building APIs, and when to use each.",
+      "terminated": "done",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "plan_research",
+          "ok": true
+        },
+        {
+          "step": 2,
+          "tool": "web_search",
+          "ok": true
+        },
+        {
+          "step": 3,
+          "tool": "fetch_page",
+          "ok": true
+        },
+        {
+          "step": 4,
+          "tool": "fetch_page",
+          "ok": false,
+          "error": "fetch 403"
+        },
+        {
+          "step": 5,
+          "tool": "web_search",
+          "ok": true
+        },
+        {
+          "step": 6,
+          "tool": "fetch_page",
+          "ok": true
+        },
+        {
+          "step": 7,
+          "tool": "web_search",
+          "ok": true
+        },
+        {
+          "step": 8,
+          "tool": "fetch_page",
+          "ok": true
+        },
+        {
+          "step": 9,
+          "tool": "fetch_page",
+          "ok": false,
+          "error": "fetch 403"
+        },
+        {
+          "step": 10,
+          "tool": "web_search",
+          "ok": true
+        },
+        {
+          "step": 11,
+          "tool": "fetch_page",
+          "ok": true
+        },
+        {
+          "step": 12,
+          "tool": "fetch_page",
+          "ok": true
+        }
+      ],
+      "notes": "Deep run on a multi-part question. plan_research decomposed it into 4 sub-questions BEFORE any retrieval (plan streamed first), then the loop ran 4 web_search calls each followed by fetch_page reads. Two fetch_page calls hit 403 and were recorded ok:false with the error rather than aborting the run — a blocked page is a normal observation, not a fatal error, so the loop moved to the next source. Terminated done at 12 tool calls (inside the 24-call deep budget), cost 0.0205 USD, ttft 34.9s on free tier. Takeaway: the agent owns the whole loop — planning, tool choice, graceful degradation on a dead source — and every step is legible from the run log alone."
+    },
+    "failing": {
+      "requestId": "req_7cdc9ef9-484",
+      "query": "What is the largest planet in the solar system?",
+      "terminated": "error",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "web_search",
+          "ok": true
+        }
+      ],
+      "notes": "Fail-loud example captured live under a sustained concurrency-4 burst on Render free tier. web_search succeeded, then the LLM synthesis call to the provider threw a transport error (fetch failed) because the shared 0.1-CPU event loop was starved and the outbound HTTPS to the provider could not complete. The agent set terminated:error and emitted an SSE error frame carrying status 502 — it did NOT serve a 2xx with a fabricated or half-grounded answer. That is the P1/A1 red line working: a provider exception fails loud, never degrades silently into an invented answer. Takeaway: fail-loud is visible in the trajectory — one good tool call, a hard error stop, and zero tokens emitted."
+    }
+  }
+}
