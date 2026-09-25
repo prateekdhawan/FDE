@@ -1,0 +1,77 @@
+# LennyHub Studio corpus — 10 Lenny's Podcast episodes (AI / product / growth).
+# Replaces the original 6 medical eval videos. Transcripts come from the user's
+# own repo traversaal-ai/lennyhub-rag (clean, diarized, timestamped) via
+# scripts/ingest_lenny.py — `transcript` is the exact .txt filename stem there.
+# `id` uses an `l` prefix so cached medical data (data/transcripts/v1-6.json,
+# data/embeddings/*) is never clobbered.
+videos:
+  - id: l1
+    url: "https://youtu.be/R-zCfLQD_84"
+    title: "Why AI is disrupting traditional product management | Tomer Cohen (LinkedIn CPO)"
+    guest: "Tomer Cohen"
+    transcript: "Tomer Cohen 2.0"
+    content_labels: ["ai", "product-management", "leadership"]
+    published_at: "2025-09-01"
+  - id: l2
+    url: "https://youtu.be/kOnsqqVbIeY"
+    title: "Inside Google's AI turnaround: AI Mode, AI Overviews, and the vision for AI-powered search | Robby Stein"
+    guest: "Robby Stein"
+    transcript: "Robby Stein"
+    content_labels: ["ai", "search", "product-management"]
+    published_at: "2025-08-01"
+  - id: l3
+    url: "https://youtu.be/iT7kq-R3Gjc"
+    title: "The ultimate guide to AEO: How to get ChatGPT to recommend your product | Ethan Smith (Graphite)"
+    guest: "Ethan Smith"
+    transcript: "Ethan Smith"
+    content_labels: ["growth", "search", "ai"]
+    published_at: "2025-07-01"
+  - id: l4
+    url: "https://youtu.be/cX4cL6B-_aU"
+    title: "Why ChatGPT will be the next big growth channel (and how to capitalize on it) | Brian Balfour"
+    guest: "Brian Balfour"
+    transcript: "Brian Balfour"
+    content_labels: ["growth", "ai"]
+    published_at: "2025-06-01"
+  - id: l5
+    url: "https://youtu.be/c_w0LaFahxk"
+    title: "From managing people to managing AI: The leadership skills everyone needs now | Julie Zhuo"
+    guest: "Julie Zhuo"
+    transcript: "Julie Zhuo 2.0"
+    content_labels: ["leadership", "ai", "product-management"]
+    published_at: "2025-08-15"
+  - id: l6
+    url: "https://youtu.be/HbbfXAWcuUo"
+    title: "Microsoft CPO: If you aren't prototyping with AI you're doing it wrong | Aparna Chennapragada"
+    guest: "Aparna Chennapragada"
+    transcript: "Aparna Chennapragada"
+    content_labels: ["ai", "product-management", "design"]
+    published_at: "2025-05-01"
+  - id: l7
+    url: "https://youtu.be/ixY2PvQJ0To"
+    title: "Inside ChatGPT: The fastest growing product in history | Nick Turley (OpenAI)"
+    guest: "Nick Turley"
+    transcript: "Nick Turley"
+    content_labels: ["ai", "product-management", "growth"]
+    published_at: "2025-04-01"
+  - id: l8
+    url: "https://youtu.be/scsW6_2SPC4"
+    title: "OpenAI's CPO on how AI changes must-have skills, moats, coding, and startup playbooks | Kevin Weil"
+    guest: "Kevin Weil"
+    transcript: "Kevin Weil"
+    content_labels: ["ai", "product-management", "career"]
+    published_at: "2025-03-01"
+  - id: l9
+    url: "https://youtu.be/WyJV6VwEGA8"
+    title: "Figma's CEO: Why AI makes design, craft, and quality the new moat for startups | Dylan Field"
+    guest: "Dylan Field"
+    transcript: "Dylan Field 2.0"
+    content_labels: ["ai", "design", "founder"]
+    published_at: "2025-09-15"
+  - id: l10
+    url: "https://youtu.be/qbvY0dQgSJ4"
+    title: "AI Engineering 101 with Chip Huyen (Nvidia, Stanford, Netflix)"
+    guest: "Chip Huyen"
+    transcript: "Chip Huyen"
+    content_labels: ["ai", "evals", "career"]
+    published_at: "2025-10-01"

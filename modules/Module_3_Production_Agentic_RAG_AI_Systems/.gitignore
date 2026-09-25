@@ -1,0 +1,9 @@
+# Large / regenerable assets excluded to keep the repo lean.
+# The complete Module 3 (including these files) lives locally in
+# FDE_Course/Assignment_3A_RAG.
+# Source: github.com/hamzafarooq/multi-agent-course
+#         /modules/Module_3_Production_Agentic_RAG_AI_Systems
+*.mp4
+*.npz
+*.pdf
+qdrant_data/
